@@ -1,0 +1,44 @@
+Intelligent Route Planner Using Graph Algorithms
+Submitted By:
+Wali Ahmad
+
+Technology:
+Python
+Graphs
+BFS
+DFS
+Dijkstra Algorithm
+Priority Queue
+Introduction
+An Intelligent Route Planner is a system that finds the best route between two locations.
+
+It uses graph algorithms to calculate the shortest path and total distance.
+
+Applications:
+• Google Maps
+• Uber
+• Ola
+• Zomato
+• Swiggy
+• Logistics Companies
+
+
+
+Objective
+1. Create city map
+2. Store locations as nodes
+3. Store roads as edges
+4. Apply BFS and DFS
+5. Apply Dijkstra Algorithm
+6. Find shortest route
+7. Calculate total distance
+8. Generate route report
+DSA Concepts Used
+1. Graph
+2. Nodes
+3. Edges
+4. Adjacency List
+5. BFS
+6. DFS
+7. Dijkstra
+8. Min Heap
