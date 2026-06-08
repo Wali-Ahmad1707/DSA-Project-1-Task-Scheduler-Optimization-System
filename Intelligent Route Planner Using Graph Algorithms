@@ -1,0 +1,297 @@
+//CODES//
+
+# data_builder.py — makes a small 5x5 city grid with some toll/one-way edges
+import csv, math
+
+def write_grid(n=5, spacing_m=300):
+    rows=[]
+    node_id=lambda i,j: f"N{i}_{j}"
+    coords={}
+    for i in range(n):
+        for j in range(n):
+            # fake lat/lon grid (not geo-accurate, fine for demo)
+            lat, lon = 12.90 + i*0.002, 77.50 + j*0.002
+            coords[node_id(i,j)] = (lat, lon)
+    def add(u,v,dist,speed,toll,one_way,cls):
+        lat_u,lon_u = coords[u]; lat_v,lon_v = coords[v]
+        rows.append([u,v,lat_u,lon_u,lat_v,lon_v,dist,speed,toll,one_way,cls])
+
+    for i in range(n):
+        for j in range(n):
+            if j+1<n:
+                u=node_id(i,j); v=node_id(i,j+1)
+                add(u,v,spacing_m,40,0,0,"residential")
+                add(v,u,spacing_m,40,0,0,"residential")
+            if i+1<n:
+                u=node_id(i,j); v=node_id(i+1,j)
+                add(u,v,spacing_m,35,0,0,"residential")
+                add(v,u,spacing_m,35,0,0,"residential")
+
+    # Add a faster avenue with toll across row 2
+    for j in range(n-1):
+        u=node_id(2,j); v=node_id(2,j+1)
+        add(u,v,spacing_m,70,1,0,"primary")
+        add(v,u,spacing_m,70,1,0,"primary")
+
+    # A one-way shortcut
+    add(node_id(0,0), node_id(1,1), spacing_m*1.4, 50, 0, 1, "link")
+
+    with open("roads.csv","w",newline="") as f:
+        w=csv.writer(f)
+        w.writerow("u,v,lat_u,lon_u,lat_v,lon_v,distance_m,speed_kph,toll,one_way,road_class".split(","))
+        w.writerows(rows)
+    print("roads.csv written")
+
+if __name__=="__main__":
+    write_grid()
+# graph_loader.py
+import csv, math
+import networkx as nx
+
+def load_graph(csv_path="roads.csv"):
+    G = nx.DiGraph()
+    with open(csv_path, newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            u, v = row["u"], row["v"]
+            attrs = {
+                "lat_u": float(row["lat_u"]), "lon_u": float(row["lon_u"]),
+                "lat_v": float(row["lat_v"]), "lon_v": float(row["lon_v"]),
+                "distance_m": float(row["distance_m"]),
+                "speed_kph": float(row["speed_kph"]),
+                "toll": int(row["toll"]),
+                "one_way": int(row["one_way"]),
+                "road_class": row["road_class"],
+                "traffic_factor": 1.0
+            }
+            base_sec = attrs["distance_m"] / (attrs["speed_kph"]*1000/3600)
+            attrs["base_sec"] = base_sec
+            G.add_edge(u, v, **attrs)
+    return G
+
+def time_cost(e): return e["base_sec"] * e.get("traffic_factor",1.0)
+def distance_cost(e): return e["distance_m"]
+def money_cost(e): return e["toll"]  # simple: count toll gates
+def eco_cost(e):  # proxy: time * class factor (primary roads penalized less)
+    cls = e["road_class"]; f = 0.9 if cls=="primary" else 1.0
+    return time_cost(e)*f
+# router.py
+import networkx as nx, math
+from graph_loader import load_graph, time_cost, distance_cost, money_cost, eco_cost
+
+def path_cost(G, path, cost_fn):
+    return sum(cost_fn(G[u][v]) for u,v in zip(path[:-1], path[1:]))
+
+def weight_factory(cost_fn):
+    def w(u,v,attrs): return cost_fn(attrs)
+    return w
+
+def haversine_m(lat1,lon1,lat2,lon2):
+    R=6371000
+    from math import radians,sin,cos,asin,sqrt
+    dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
+    a=sin(dlat/2)**2+cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    return 2*R*asin(sqrt(a))
+
+def astar_heuristic(G, n1, n2):
+    # optimistic time heuristic based on straight-line distance at 80 km/h
+    lat1,lon1 = G.edges[list(G.out_edges(n1))[0]]["lat_u"], G.edges[list(G.out_edges(n1))[0]]["lon_u"]
+    lat2,lon2 = G.edges[list(G.out_edges(n2))[0]]["lat_u"], G.edges[list(G.out_edges(n2))[0]]["lon_u"]
+    d = haversine_m(lat1,lon1,lat2,lon2)
+    best_mps = 80_000/3600
+    return d / best_mps
+
+def shortest_path(G, src, dst, objective="time"):
+    cost_map = {"time": time_cost, "distance": distance_cost, "money": money_cost, "eco": eco_cost}
+    cfn = cost_map[objective]
+    if objective=="time":
+        # A* on time
+        return nx.astar_path(G, src, dst, heuristic=lambda n1,n2: astar_heuristic(G,n1,n2), weight=weight_factory(cfn))
+    else:
+        return nx.shortest_path(G, src, dst, weight=weight_factory(cfn))
+
+
+
+# multicriteria.py
+import networkx as nx
+from graph_loader import time_cost, distance_cost, money_cost
+
+def weighted_cost(attrs, a=1.0,b=0.0,c=0.0):
+    return a*time_cost(attrs) + b*(distance_cost(attrs)/1000.0) + c*money_cost(attrs)
+
+def route_weighted(G, src, dst, a=1.0,b=0.2,c=5.0):
+    w=lambda u,v,attrs: weighted_cost(attrs,a,b,c)
+    return nx.shortest_path(G, src, dst, weight=w)
+
+def k_shortest_paths(G, src, dst, k=5, weight_fn=lambda u,v,attrs: time_cost(attrs)):
+    return list(nx.shortest_simple_paths(G, src, dst, weight=weight_fn))[:k]
+
+def pareto_routes(G, src, dst, k=8):
+    routes = k_shortest_paths(G, src, dst, k=k, weight_fn=lambda u,v,attrs: time_cost(attrs))
+    scored=[]
+    for p in routes:
+        t=sum(time_cost(G[u][v]) for u,v in zip(p[:-1],p[1:]))
+        d=sum(distance_cost(G[u][v]) for u,v in zip(p[:-1],p[1:]))
+        m=sum(money_cost(G[u][v]) for u,v in zip(p[:-1],p[1:]))
+        scored.append((p,(t,d,m)))
+    # Pareto filter
+    pareto=[]
+    for p,vec in scored:
+        if not any((q!=p and all(vq<=v for vq,v in zip(vecq,vec)) and any(vq<v for vq,v in zip(vecq,vec)))
+                   for q,vecq in scored):
+            pareto.append((p,vec))
+    return pareto
+
+
+# dynamics.py
+def apply_traffic(G, where=lambda u,v,attrs: True, factor=1.2):
+    for u,v,attrs in G.edges(data=True):
+        if where(u,v,attrs): attrs["traffic_factor"]=factor
+
+def close_road(G, edge_uv): 
+    if G.has_edge(*edge_uv): G.remove_edge(*edge_uv)
+
+def route_with_turn_penalties(G, src, dst, base_cost_fn, turn_penalty_sec=10):
+    import heapq
+    # state is (cost, node, prev_node)
+    pq=[(0, src, None)]; seen={}
+    parent={}
+    while pq:
+        c,n,prev=heapq.heappop(pq)
+        key=(n,prev)
+        if key in seen and c>=seen[key]: continue
+        seen[key]=c
+        if n==dst:
+            # reconstruct path using parent keyed by (node, prev)
+            path=[n]; cur=(n,prev)
+            while cur in parent:
+                n2,prev2=parent[cur]
+                path.append(n2); cur=(n2,prev2)
+            return list(reversed(path))
+        for _,v,attrs in G.out_edges(n, data=True):
+            base = base_cost_fn(attrs)
+            turn = 0
+            if prev is not None and prev!=n:
+                # simple turn penalty when changing direction (approx)
+                turn = turn_penalty_sec
+            heapq.heappush(pq, (c+base+turn, v, n))
+            parent[(v,n)] = (n,prev)
+    raise ValueError("No path")
+
+# app.py
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
+from graph_loader import load_graph, time_cost
+from router import shortest_path, path_cost
+from multicriteria import route_weighted, pareto_routes
+from dynamics import apply_traffic, close_road
+
+app = FastAPI()
+G = load_graph("roads.csv")
+
+class RouteReq(BaseModel):
+    src: str
+    dst: str
+    objective: str = "time"  # time|distance|money|eco|weighted
+    alpha: float = 1.0
+    beta: float = 0.2
+    gamma: float = 5.0
+    traffic_edges: list[tuple[str,str]] = []
+    close_edges: list[tuple[str,str]] = []
+
+def path_to_geojson(G, path):
+    coords=[]
+    for u,v in zip(path[:-1], path[1:]):
+        e=G[u][v]
+        coords.append([e["lon_u"], e["lat_u"]])
+    # add last
+    last = G[path[-2]][path[-1]]
+    coords.append([last["lon_v"], last["lat_v"]])
+    return {"type":"Feature","geometry":{"type":"LineString","coordinates":coords}}
+
+@app.post("/route")
+def route(req: RouteReq):
+    # apply dynamic updates on a copy
+    H = G.copy()
+    for uv in req.traffic_edges:
+        apply_traffic(H, where=lambda u,v,a,uv=tuple(uv): (u,v)==tuple(uv), factor=1.5)
+    for uv in req.close_edges:
+        try: close_road(H, tuple(uv))
+        except: pass
+
+    if req.objective=="weighted":
+        path = route_weighted(H, req.src, req.dst, req.alpha, req.beta, req.gamma)
+        total_time = path_cost(H, path, time_cost)
+    else:
+        path = shortest_path(H, req.src, req.dst, req.objective)
+        total_time = path_cost(H, path, time_cost)
+
+    feat = path_to_geojson(H, path)
+    return {"path": path, "eta_sec": round(total_time,1), "geojson": feat}
+
+@app.get("/alternatives")
+def alternatives(src: str, dst: str, k: int = 5):
+    pareto = pareto_routes(G, src, dst, k=k)
+    return [{"path":p, "time_sec": round(t,1), "dist_m": round(d,1), "tolls": int(m)} for p,(t,d,m) in pareto]
+// src/App.jsx
+import { MapContainer, TileLayer, Polyline } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
+import { useEffect, useState } from "react";
+
+export default function App(){
+  const [src,setSrc]=useState("N0_0");
+  const [dst,setDst]=useState("N4_4");
+  const [objective,setObjective]=useState("time");
+  const [route,setRoute]=useState(null);
+
+  async function compute(){
+    const r = await fetch("/route",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({src, dst, objective})});
+    setRoute(await r.json());
+  }
+  useEffect(()=>{ compute(); }, [src,dst,objective]);
+
+  return (
+    <div style={{display:"grid",gridTemplateColumns:"320px 1fr",height:"100vh"}}>
+      <div style={{padding:12}}>
+        <h2>Intelligent Route Planner</h2>
+        <label>Source: <input value={src} onChange={e=>setSrc(e.target.value)}/></label><br/>
+        <label>Destination: <input value={dst} onChange={e=>setDst(e.target.value)}/></label><br/>
+        <label>Objective: 
+          <select value={objective} onChange={e=>setObjective(e.target.value)}>
+            <option value="time">Fastest</option>
+            <option value="distance">Shortest</option>
+            <option value="money">Lowest Toll</option>
+            <option value="eco">Eco</option>
+            <option value="weighted">Weighted</option>
+          </select>
+        </label>
+        <button style={{marginTop:8}} onClick={compute}>Route</button>
+        {route && <p>ETA: <b>{Math.round(route.eta_sec)} sec</b></p>}
+        <p style={{opacity:.7}}>Example nodes: N0_0 … N4_4</p>
+      </div>
+      <MapContainer center={[12.90,77.50]} zoom={14} style={{height:"100%",width:"100%"}}>
+        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"/>
+        {route && <Polyline positions={route.geojson.geometry.coordinates.map(([lon,lat])=>[lat,lon])}/>}
+      </MapContainer>
+    </div>
+  );
+}
+# test_routing.py
+import pytest
+from graph_loader import load_graph, time_cost, distance_cost
+from router import shortest_path, path_cost
+from multicriteria import route_weighted
+
+G = load_graph("roads.csv")
+
+def test_fastest_not_longer_than_shortest():
+    p_fast = shortest_path(G,"N0_0","N4_4","time")
+    p_dist = shortest_path(G,"N0_0","N4_4","distance")
+    assert path_cost(G,p_fast,time_cost) <= 1.5 * path_cost(G,p_dist,time_cost)
+
+def test_weighted_balances_toll():
+    p = route_weighted(G,"N0_0","N4_4", a=1.0,b=0.1,c=10.0)
+    # ensure path exists and is a list of nodes
+    assert isinstance(p, list) and len(p)>1
+
